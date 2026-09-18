@@ -3,3 +3,6 @@ terraform/*.tfstate
 terraform/*.tfstate.*
 terraform/*.tfplan
 terraform/terraform.tfvars
+
+# Node.js dependencies
+node_modules/
