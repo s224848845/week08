@@ -11,7 +11,7 @@ on:
 
 jobs:
   deploy-staging:
-    name: Deploy to Staging
+    name: Deploy Application and Monitoring to Staging
     runs-on: ubuntu-latest
 
     if: >
@@ -67,85 +67,238 @@ jobs:
             --dry-run=client \
             -o yaml | kubectl apply -f -
 
-      - name: Apply Kubernetes manifests
+      - name: Apply staging Kubernetes manifests
+        run: |
+          kubectl apply -f kubernetes/staging/
+
+      - name: Deploy tested application images
+        shell: bash
+        run: |
+          IMAGE_TAG="${{ github.event.workflow_run.head_sha }}"
+
+          kubectl set image deployment/frontend \
+            frontend=${{ vars.ACR_LOGIN_SERVER }}/koalatech-frontend:$IMAGE_TAG \
+            -n staging
+
+          kubectl set image deployment/user-service \
+            user-service=${{ vars.ACR_LOGIN_SERVER }}/koalatech-user-service:$IMAGE_TAG \
+            -n staging
+
+          kubectl set image deployment/student-service \
+            student-service=${{ vars.ACR_LOGIN_SERVER }}/koalatech-student-service:$IMAGE_TAG \
+            -n staging
+
+          kubectl set image deployment/lecturer-service \
+            lecturer-service=${{ vars.ACR_LOGIN_SERVER }}/koalatech-lecturer-service:$IMAGE_TAG \
+            -n staging
+
+          kubectl set image deployment/course-service \
+            course-service=${{ vars.ACR_LOGIN_SERVER }}/koalatech-course-service:$IMAGE_TAG \
+            -n staging
+
+          kubectl set image deployment/enrollment-service \
+            enrollment-service=${{ vars.ACR_LOGIN_SERVER }}/koalatech-enrollment-service:$IMAGE_TAG \
+            -n staging
+
+      - name: Verify application rollouts
+        shell: bash
+        run: |
+          for deployment in \
+            frontend \
+            user-service \
+            student-service \
+            lecturer-service \
+            course-service \
+            enrollment-service
+          do
+            echo "Checking rollout: $deployment"
+
+            kubectl rollout status deployment/$deployment \
+              -n staging \
+              --timeout=300s
+          done
+
+      - name: Create monitoring namespace
         run: |
           kubectl apply \
-            -f kubernetes/staging/
+            -f kubernetes/monitoring/01-namespace.yaml
 
-      - name: Update frontend image
+      - name: Create Grafana admin secret
         run: |
-          kubectl set image deployment/frontend \
-            frontend=${{ vars.ACR_LOGIN_SERVER }}/koalatech-frontend:${{ github.event.workflow_run.head_sha }} \
-            -n staging
+          kubectl create secret generic grafana-admin \
+            --namespace monitoring \
+            --from-literal=password="${{ secrets.GRAFANA_ADMIN_PASSWORD }}" \
+            --dry-run=client \
+            -o yaml | kubectl apply -f -
 
-      - name: Update user-service image
+      - name: Deploy Prometheus and Grafana monitoring
         run: |
-          kubectl set image deployment/user-service \
-            user-service=${{ vars.ACR_LOGIN_SERVER }}/koalatech-user-service:${{ github.event.workflow_run.head_sha }} \
-            -n staging
+          kubectl apply \
+            -f kubernetes/monitoring/
 
-      - name: Update student-service image
+      - name: Verify monitoring rollouts
+        shell: bash
         run: |
-          kubectl set image deployment/student-service \
-            student-service=${{ vars.ACR_LOGIN_SERVER }}/koalatech-student-service:${{ github.event.workflow_run.head_sha }} \
-            -n staging
+          for deployment in \
+            kube-state-metrics \
+            prometheus \
+            grafana
+          do
+            echo "Checking monitoring deployment: $deployment"
 
-      - name: Update lecturer-service image
-        run: |
-          kubectl set image deployment/lecturer-service \
-            lecturer-service=${{ vars.ACR_LOGIN_SERVER }}/koalatech-lecturer-service:${{ github.event.workflow_run.head_sha }} \
-            -n staging
+            kubectl rollout status deployment/$deployment \
+              -n monitoring \
+              --timeout=300s
+          done
 
-      - name: Update course-service image
+      - name: Verify Prometheus targets
+        shell: bash
         run: |
-          kubectl set image deployment/course-service \
-            course-service=${{ vars.ACR_LOGIN_SERVER }}/koalatech-course-service:${{ github.event.workflow_run.head_sha }} \
-            -n staging
+          kubectl port-forward \
+            -n monitoring \
+            svc/prometheus \
+            9090:9090 > /tmp/prometheus-port-forward.log 2>&1 &
 
-      - name: Update enrollment-service image
-        run: |
-          kubectl set image deployment/enrollment-service \
-            enrollment-service=${{ vars.ACR_LOGIN_SERVER }}/koalatech-enrollment-service:${{ github.event.workflow_run.head_sha }} \
-            -n staging
+          PF_PID=$!
 
-      - name: Wait for frontend rollout
-        run: |
-          kubectl rollout status deployment/frontend \
-            -n staging \
-            --timeout=300s
+          cleanup() {
+            kill "$PF_PID" 2>/dev/null || true
+          }
 
-      - name: Wait for user-service rollout
-        run: |
-          kubectl rollout status deployment/user-service \
-            -n staging \
-            --timeout=300s
+          trap cleanup EXIT
 
-      - name: Wait for student-service rollout
-        run: |
-          kubectl rollout status deployment/student-service \
-            -n staging \
-            --timeout=300s
+          echo "Waiting for Prometheus API..."
 
-      - name: Wait for lecturer-service rollout
-        run: |
-          kubectl rollout status deployment/lecturer-service \
-            -n staging \
-            --timeout=300s
+          for attempt in {1..20}
+          do
+            if curl --fail --silent \
+              http://127.0.0.1:9090/-/ready > /dev/null
+            then
+              echo "Prometheus is ready."
+              break
+            fi
 
-      - name: Wait for course-service rollout
-        run: |
-          kubectl rollout status deployment/course-service \
-            -n staging \
-            --timeout=300s
+            if [ "$attempt" -eq 20 ]; then
+              echo "Prometheus did not become ready."
+              cat /tmp/prometheus-port-forward.log
+              exit 1
+            fi
 
-      - name: Wait for enrollment-service rollout
+            sleep 3
+          done
+
+          echo
+          echo "Prometheus targets:"
+          curl --fail --silent \
+            http://127.0.0.1:9090/api/v1/targets \
+            > /tmp/prometheus-targets.json
+
+          python3 - <<'PY'
+          import json
+
+          with open("/tmp/prometheus-targets.json") as file:
+              data = json.load(file)
+
+          targets = data["data"]["activeTargets"]
+
+          for target in targets:
+              labels = target.get("labels", {})
+              job = labels.get("job", "unknown")
+              health = target.get("health", "unknown")
+              scrape_url = target.get("scrapeUrl", "")
+
+              print(
+                  f"{job:25} "
+                  f"health={health:8} "
+                  f"{scrape_url}"
+              )
+
+          required_jobs = {
+              "user-service",
+              "student-service",
+              "lecturer-service",
+              "course-service",
+              "enrollment-service",
+              "kube-state-metrics",
+          }
+
+          healthy_jobs = {
+              target.get("labels", {}).get("job")
+              for target in targets
+              if target.get("health") == "up"
+          }
+
+          missing = required_jobs - healthy_jobs
+
+          if missing:
+              raise SystemExit(
+                  "Required Prometheus targets are not healthy: "
+                  + ", ".join(sorted(missing))
+              )
+
+          print()
+          print("All required Prometheus targets are healthy.")
+          PY
+
+      - name: Verify Grafana health
+        shell: bash
         run: |
-          kubectl rollout status deployment/enrollment-service \
-            -n staging \
-            --timeout=300s
+          kubectl port-forward \
+            -n monitoring \
+            svc/grafana \
+            3000:3000 > /tmp/grafana-port-forward.log 2>&1 &
+
+          PF_PID=$!
+
+          cleanup() {
+            kill "$PF_PID" 2>/dev/null || true
+          }
+
+          trap cleanup EXIT
+
+          echo "Waiting for Grafana..."
+
+          for attempt in {1..20}
+          do
+            if curl --fail --silent \
+              http://127.0.0.1:3000/api/health
+            then
+              echo
+              echo "Grafana is healthy."
+              exit 0
+            fi
+
+            sleep 3
+          done
+
+          echo "Grafana health validation failed."
+          cat /tmp/grafana-port-forward.log
+          exit 1
 
       - name: Show staging resources
+        if: always()
         run: |
-          kubectl get pods -n staging
+          echo "===== STAGING PODS ====="
+          kubectl get pods -n staging -o wide
+
+          echo
+          echo "===== STAGING SERVICES ====="
           kubectl get services -n staging
+
+          echo
+          echo "===== STAGING PVCs ====="
           kubectl get pvc -n staging
+
+      - name: Show monitoring resources
+        if: always()
+        run: |
+          echo "===== MONITORING DEPLOYMENTS ====="
+          kubectl get deployments -n monitoring
+
+          echo
+          echo "===== MONITORING PODS ====="
+          kubectl get pods -n monitoring -o wide
+
+          echo
+          echo "===== MONITORING SERVICES ====="
+          kubectl get services -n monitoring
