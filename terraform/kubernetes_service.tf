@@ -19,12 +19,13 @@ resource "azurerm_kubernetes_cluster" "aks" {
 
   tags = {
     project     = "SIT722"
-    task        = "8.1P"
-    environment = "week08"
+    task        = "10.2D"
+    environment = "week10"
+    purpose     = "infrastructure-security-monitoring"
   }
 }
 
-# Allow AKS to pull container images from ACR
+# Allow AKS to pull container images from ACR.
 resource "azurerm_role_assignment" "acr_pull" {
   principal_id                     = azurerm_kubernetes_cluster.aks.kubelet_identity[0].object_id
   role_definition_name             = "AcrPull"
