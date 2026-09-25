@@ -293,16 +293,25 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      # -------------------------------------------------------
+      # Azure authentication
+      # -------------------------------------------------------
       - name: Login to Azure
         uses: azure/login@v3
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
 
+      # -------------------------------------------------------
+      # Authenticate with Azure Container Registry
+      # -------------------------------------------------------
       - name: Login to Azure Container Registry
         run: |
           az acr login \
             --name ${{ vars.ACR_NAME }}
 
+      # -------------------------------------------------------
+      # Build image locally before security analysis
+      # -------------------------------------------------------
       - name: Build Docker image
         run: |
           docker build \
@@ -311,7 +320,24 @@ jobs:
             ./${{ matrix.service }}
 
       # -------------------------------------------------------
-      # Docker Scout vulnerability analysis BEFORE push
+      # Docker Hub authentication for Docker Scout
+      #
+      # Required repository secrets:
+      #   DOCKERHUB_USERNAME
+      #   DOCKERHUB_TOKEN
+      # -------------------------------------------------------
+      - name: Login to Docker Hub for Docker Scout
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # -------------------------------------------------------
+      # Docker Scout vulnerability analysis BEFORE ACR push
+      #
+      # exit-code is false so identified vulnerabilities are
+      # reported without preventing the assessment pipeline
+      # from continuing. Remediation is demonstrated separately.
       # -------------------------------------------------------
       - name: Docker Scout CVE scan
         uses: docker/scout-action@v1
@@ -321,14 +347,22 @@ jobs:
           only-severities: critical,high
           write-comment: false
           exit-code: false
+          github-token: ${{ secrets.GITHUB_TOKEN }}
 
+      # -------------------------------------------------------
+      # Obtain Docker Scout remediation guidance
+      # -------------------------------------------------------
       - name: Docker Scout remediation recommendations
         uses: docker/scout-action@v1
         with:
           command: recommendations
           image: local://${{ vars.ACR_LOGIN_SERVER }}/${{ matrix.image }}:${{ github.sha }}
           write-comment: false
+          github-token: ${{ secrets.GITHUB_TOKEN }}
 
+      # -------------------------------------------------------
+      # Publish security-scanned image to ACR
+      # -------------------------------------------------------
       - name: Push Docker image with commit SHA
         run: |
           docker push \
