@@ -174,7 +174,7 @@ jobs:
             if curl --fail --silent \
               http://127.0.0.1:9090/-/ready > /dev/null
             then
-              echo "Prometheus is ready."
+              echo "Prometheus API is ready."
               break
             fi
 
@@ -184,34 +184,29 @@ jobs:
               exit 1
             fi
 
+            echo "Prometheus API not ready yet - attempt ${attempt}/20"
             sleep 3
           done
 
           echo
-          echo "Prometheus targets:"
-          curl --fail --silent \
-            http://127.0.0.1:9090/api/v1/targets \
-            > /tmp/prometheus-targets.json
+          echo "Waiting for all required Prometheus targets to become healthy..."
 
-          python3 - <<'PY'
+          for attempt in {1..12}
+          do
+            echo
+            echo "Target health check ${attempt}/12"
+
+            curl --fail --silent \
+              http://127.0.0.1:9090/api/v1/targets \
+              > /tmp/prometheus-targets.json
+
+            if python3 - <<'PYTHON'
           import json
 
           with open("/tmp/prometheus-targets.json") as file:
               data = json.load(file)
 
           targets = data["data"]["activeTargets"]
-
-          for target in targets:
-              labels = target.get("labels", {})
-              job = labels.get("job", "unknown")
-              health = target.get("health", "unknown")
-              scrape_url = target.get("scrapeUrl", "")
-
-              print(
-                  f"{job:25} "
-                  f"health={health:8} "
-                  f"{scrape_url}"
-              )
 
           required_jobs = {
               "user-service",
@@ -222,23 +217,61 @@ jobs:
               "kube-state-metrics",
           }
 
+          target_status = {}
+
+          for target in targets:
+              labels = target.get("labels", {})
+              job = labels.get("job", "unknown")
+              health = target.get("health", "unknown")
+              scrape_url = target.get("scrapeUrl", "")
+              last_error = target.get("lastError", "")
+
+              if job in required_jobs:
+                  target_status[job] = health
+
+                  print(
+                      f"{job:25} "
+                      f"health={health:8} "
+                      f"{scrape_url}"
+                  )
+
+                  if last_error:
+                      print(f"  error: {last_error}")
+
           healthy_jobs = {
-              target.get("labels", {}).get("job")
-              for target in targets
-              if target.get("health") == "up"
+              job
+              for job, health in target_status.items()
+              if health == "up"
           }
 
           missing = required_jobs - healthy_jobs
 
           if missing:
-              raise SystemExit(
-                  "Required Prometheus targets are not healthy: "
+              print()
+              print(
+                  "Targets not healthy yet: "
                   + ", ".join(sorted(missing))
               )
+              raise SystemExit(1)
 
           print()
           print("All required Prometheus targets are healthy.")
-          PY
+          PYTHON
+            then
+              echo
+              echo "Prometheus monitoring validation successful."
+              exit 0
+            fi
+
+            if [ "$attempt" -eq 12 ]; then
+              echo
+              echo "Required Prometheus targets did not become healthy within 120 seconds."
+              exit 1
+            fi
+
+            echo "Waiting 10 seconds before retry..."
+            sleep 10
+          done
 
       - name: Verify Grafana health
         shell: bash
