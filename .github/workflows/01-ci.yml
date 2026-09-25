@@ -143,15 +143,21 @@ jobs:
           npm run test -- --run
 
   # =========================================================
-  # Terraform Validation and Plan
+  # Terraform Validation, Plan and Provisioning
   # Task 10.2D - Infrastructure as Code integration
+  #
+  # Pull Request:
+  #   Init -> Format -> Validate -> Plan
+  #
+  # Main/Manual:
+  #   Init -> Format -> Validate -> Plan -> Apply
   # =========================================================
   terraform-check:
-    name: Terraform Validation and Plan
+    name: Terraform Validate, Plan and Apply
     runs-on: ubuntu-latest
 
     # terraform.tfvars is intentionally not committed.
-    # Non-sensitive Week10 values are supplied using TF_VAR_*.
+    # Week10 values are supplied through TF_VAR_* variables.
     env:
       TF_VAR_resource_group_name: "sit722-week10-rg"
       TF_VAR_location: "Australia East"
@@ -173,10 +179,18 @@ jobs:
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
 
+      # -------------------------------------------------------
+      # Persistent Terraform state
+      # -------------------------------------------------------
       - name: Terraform Init
         working-directory: terraform
         run: |
-          terraform init -input=false
+          terraform init \
+            -input=false \
+            -backend-config="resource_group_name=sit722-week10-tfstate-rg" \
+            -backend-config="storage_account_name=sit722w10tfstate224848" \
+            -backend-config="container_name=tfstate" \
+            -backend-config="key=week10-10.2d.tfstate"
 
       - name: Terraform Format Check
         working-directory: terraform
@@ -188,12 +202,47 @@ jobs:
         run: |
           terraform validate
 
+      # -------------------------------------------------------
+      # Generate a saved Terraform plan.
+      # -------------------------------------------------------
       - name: Terraform Plan
         working-directory: terraform
         run: |
           terraform plan \
             -input=false \
-            -no-color
+            -no-color \
+            -out=tfplan
+
+      # -------------------------------------------------------
+      # Infrastructure provisioning
+      #
+      # Pull requests NEVER provision infrastructure.
+      # Apply occurs only for main push or controlled
+      # workflow_dispatch execution.
+      # -------------------------------------------------------
+      - name: Terraform Apply
+        if: >
+          github.event_name == 'push' ||
+          github.event_name == 'workflow_dispatch'
+        working-directory: terraform
+        run: |
+          terraform apply \
+            -input=false \
+            -auto-approve \
+            tfplan
+
+      - name: Display Terraform Outputs
+        if: >
+          github.event_name == 'push' ||
+          github.event_name == 'workflow_dispatch'
+        working-directory: terraform
+        run: |
+          echo "===== TERRAFORM OUTPUTS ====="
+          terraform output
+
+          echo
+          echo "===== TERRAFORM STATE ====="
+          terraform state list
 
   # =========================================================
   # Build, Security Scan and Push Docker Images
@@ -203,8 +252,9 @@ jobs:
     name: Build, Scan and Push ${{ matrix.image }}
     runs-on: ubuntu-latest
 
-    # Application tests AND Terraform validation must succeed
-    # before container images are published.
+    # Application tests AND Terraform infrastructure
+    # provisioning/validation must succeed before images
+    # are published.
     needs:
       - backend-test
       - frontend-test
@@ -261,11 +311,7 @@ jobs:
             ./${{ matrix.service }}
 
       # -------------------------------------------------------
-      # Docker Scout vulnerability analysis occurs BEFORE push.
-      #
-      # The scan is currently evidence/reporting mode while the
-      # actual Task 10.2D vulnerability is identified and
-      # remediated. The image will subsequently be rescanned.
+      # Docker Scout vulnerability analysis BEFORE push
       # -------------------------------------------------------
       - name: Docker Scout CVE scan
         uses: docker/scout-action@v1
