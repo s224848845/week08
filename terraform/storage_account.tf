@@ -10,7 +10,8 @@ resource "azurerm_storage_account" "storage" {
 
   tags = {
     project     = "SIT722"
-    task        = "8.1P"
-    environment = "week08"
+    task        = "10.2D"
+    environment = "week10"
+    purpose     = "infrastructure-security-monitoring"
   }
 }

@@ -27,10 +27,16 @@ variable "storage_account_name" {
 variable "aks_node_count" {
   description = "Number of AKS worker nodes"
   type        = number
-  default     = 3
+  default     = 1
+
+  validation {
+    condition     = var.aks_node_count >= 1
+    error_message = "AKS must contain at least one worker node."
+  }
 }
 
 variable "aks_vm_size" {
   description = "VM size used by the AKS default node pool"
   type        = string
+  default     = "Standard_D2s_v3"
 }

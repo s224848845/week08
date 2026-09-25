@@ -4,8 +4,6 @@ on:
   # =========================================================
   # Pull Request Validation
   # =========================================================
-  # Run tests when a pull request targets main.
-  # Docker images are NOT built/pushed for pull requests.
   pull_request:
     branches:
       - main
@@ -13,13 +11,11 @@ on:
   # =========================================================
   # Main Branch CI
   # =========================================================
-  # After a pull request is merged into main, run tests,
-  # build the Docker images and push them to ACR.
   push:
     branches:
       - main
 
-  # Allow the workflow to be started manually if required.
+  # Allow controlled manual execution from GitHub Actions.
   workflow_dispatch:
 
 jobs:
@@ -118,9 +114,6 @@ jobs:
     name: Test Frontend
     runs-on: ubuntu-latest
 
-    # Test-only service URLs required by the Vite frontend.
-    # These values allow frontend modules to initialise during
-    # unit testing without requiring deployed backend services.
     env:
       VITE_USER_SERVICE_URL: http://localhost:8001
       VITE_STUDENT_SERVICE_URL: http://localhost:8002
@@ -148,22 +141,127 @@ jobs:
         working-directory: frontend
         run: |
           npm run test -- --run
+
   # =========================================================
-  # Build and Push Docker Images
+  # Terraform Validation, Plan and Provisioning
+  # Task 10.2D - Infrastructure as Code integration
+  #
+  # Pull Request:
+  #   Init -> Format -> Validate -> Plan
+  #
+  # Main/Manual:
+  #   Init -> Format -> Validate -> Plan -> Apply
   # =========================================================
-  build-and-push:
-    name: Build and Push ${{ matrix.image }}
+  terraform-check:
+    name: Terraform Validate, Plan and Apply
     runs-on: ubuntu-latest
 
-    # Both backend and frontend tests must pass before
-    # Docker images can be built and pushed.
+    # terraform.tfvars is intentionally not committed.
+    # Week10 values are supplied through TF_VAR_* variables.
+    env:
+      TF_VAR_resource_group_name: "sit722-week10-rg"
+      TF_VAR_location: "Australia East"
+      TF_VAR_acr_name: "sit722week10acr224848845"
+      TF_VAR_aks_name: "sit722-week10-aks"
+      TF_VAR_storage_account_name: "sit722w10storage224848"
+      TF_VAR_aks_node_count: "1"
+      TF_VAR_aks_vm_size: "Standard_D2s_v3"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+
+      - name: Login to Azure
+        uses: azure/login@v3
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      # -------------------------------------------------------
+      # Persistent Terraform state
+      # -------------------------------------------------------
+      - name: Terraform Init
+        working-directory: terraform
+        run: |
+          terraform init \
+            -input=false \
+            -backend-config="resource_group_name=sit722-week10-tfstate-rg" \
+            -backend-config="storage_account_name=sit722w10tfstate224848" \
+            -backend-config="container_name=tfstate" \
+            -backend-config="key=week10-10.2d.tfstate"
+
+      - name: Terraform Format Check
+        working-directory: terraform
+        run: |
+          terraform fmt -check
+
+      - name: Terraform Validate
+        working-directory: terraform
+        run: |
+          terraform validate
+
+      # -------------------------------------------------------
+      # Generate a saved Terraform plan.
+      # -------------------------------------------------------
+      - name: Terraform Plan
+        working-directory: terraform
+        run: |
+          terraform plan \
+            -input=false \
+            -no-color \
+            -out=tfplan
+
+      # -------------------------------------------------------
+      # Infrastructure provisioning
+      #
+      # Pull requests NEVER provision infrastructure.
+      # Apply occurs only for main push or controlled
+      # workflow_dispatch execution.
+      # -------------------------------------------------------
+      - name: Terraform Apply
+        if: >
+          github.event_name == 'push' ||
+          github.event_name == 'workflow_dispatch'
+        working-directory: terraform
+        run: |
+          terraform apply \
+            -input=false \
+            -auto-approve \
+            tfplan
+
+      - name: Display Terraform Outputs
+        if: >
+          github.event_name == 'push' ||
+          github.event_name == 'workflow_dispatch'
+        working-directory: terraform
+        run: |
+          echo "===== TERRAFORM OUTPUTS ====="
+          terraform output
+
+          echo
+          echo "===== TERRAFORM STATE ====="
+          terraform state list
+
+  # =========================================================
+  # Build, Security Scan and Push Docker Images
+  # Task 10.2D - Docker Scout integration
+  # =========================================================
+  build-scan-and-push:
+    name: Build, Scan and Push ${{ matrix.image }}
+    runs-on: ubuntu-latest
+
+    # Application tests AND Terraform infrastructure
+    # provisioning/validation must succeed before images
+    # are published.
     needs:
       - backend-test
       - frontend-test
+      - terraform-check
 
-    # Do not build/push images for pull requests.
-    # Build/push only after changes reach main or when
-    # the workflow is manually triggered.
+    # Pull requests perform validation only.
+    # Images are published for main or controlled manual runs.
     if: >
       github.event_name == 'push' ||
       github.event_name == 'workflow_dispatch'
@@ -195,16 +293,25 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      # -------------------------------------------------------
+      # Azure authentication
+      # -------------------------------------------------------
       - name: Login to Azure
         uses: azure/login@v3
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
 
+      # -------------------------------------------------------
+      # Authenticate with Azure Container Registry
+      # -------------------------------------------------------
       - name: Login to Azure Container Registry
         run: |
           az acr login \
             --name ${{ vars.ACR_NAME }}
 
+      # -------------------------------------------------------
+      # Build image locally before security analysis
+      # -------------------------------------------------------
       - name: Build Docker image
         run: |
           docker build \
@@ -212,6 +319,50 @@ jobs:
             -t ${{ vars.ACR_LOGIN_SERVER }}/${{ matrix.image }}:${{ github.sha }} \
             ./${{ matrix.service }}
 
+      # -------------------------------------------------------
+      # Docker Hub authentication for Docker Scout
+      #
+      # Required repository secrets:
+      #   DOCKERHUB_USERNAME
+      #   DOCKERHUB_TOKEN
+      # -------------------------------------------------------
+      - name: Login to Docker Hub for Docker Scout
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # -------------------------------------------------------
+      # Docker Scout vulnerability analysis BEFORE ACR push
+      #
+      # exit-code is false so identified vulnerabilities are
+      # reported without preventing the assessment pipeline
+      # from continuing. Remediation is demonstrated separately.
+      # -------------------------------------------------------
+      - name: Docker Scout CVE scan
+        uses: docker/scout-action@v1
+        with:
+          command: cves
+          image: local://${{ vars.ACR_LOGIN_SERVER }}/${{ matrix.image }}:${{ github.sha }}
+          only-severities: critical,high
+          write-comment: false
+          exit-code: false
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      # -------------------------------------------------------
+      # Obtain Docker Scout remediation guidance
+      # -------------------------------------------------------
+      - name: Docker Scout remediation recommendations
+        uses: docker/scout-action@v1
+        with:
+          command: recommendations
+          image: local://${{ vars.ACR_LOGIN_SERVER }}/${{ matrix.image }}:${{ github.sha }}
+          write-comment: false
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      # -------------------------------------------------------
+      # Publish security-scanned image to ACR
+      # -------------------------------------------------------
       - name: Push Docker image with commit SHA
         run: |
           docker push \

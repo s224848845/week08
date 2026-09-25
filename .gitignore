@@ -6,3 +6,7 @@ terraform/terraform.tfvars
 
 # Node.js dependencies
 node_modules/
+
+# Python generated files
+__pycache__/
+*.py[cod]
